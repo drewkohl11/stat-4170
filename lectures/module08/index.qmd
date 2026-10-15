@@ -310,7 +310,7 @@ None of this replaces the modeling tools from Module 7 — it's the institutiona
 
 ## The Avellaneda-Stoikov Model
 
-Following Avellaneda & Stoikov (2008), with midprice $s$, inventory $q$, time-to-horizon $\tau$:
+Following Avellaneda & Stoikov (2008), with midprice $s$, inventory $q$, time-to-horizon $\tau$, risk aversion $\gamma$, and volatility $\sigma$:
 
 $$
 \text{reservation price: } r = s - q\gamma\sigma^2\tau, \qquad
@@ -318,6 +318,21 @@ $$
 $$
 
 Quotes are $\text{bid} = r - \delta$, $\text{ask} = r + \delta$. The reservation price is an **inventory skew**: as $q$ grows, $r$ shifts below $s$, making the bid less attractive (harder to buy more) and the ask more attractive (easier to sell) — the market maker leans against its own position. Left unmanaged, inventory that fills roughly symmetrically just drifts like a random walk toward whatever hard risk limit is in place; this skew is what keeps it from doing that. This is a preview: a full derivation and justification of why this particular skew stabilizes inventory is part of what the case study asks you to investigate.
+
+## Where Do $A$ and $k$ Come From?
+
+The half-spread formula has a $k$ in it we haven't explained yet. The model assumes orders arrive to **hit your quote** at a rate that decays the farther your quote sits from the mid:
+
+$$
+\lambda(\delta) = Ae^{-k\delta}
+$$
+
+where $\delta$ is the distance from the mid and $\lambda(\delta)$ is fills per unit time at that distance.
+
+- $A$ is the fill-intensity **at the touch** ($\delta = 0$)
+- $k$ is **how fast** that intensity decays as you quote farther away — a bigger $k$ means moving away from the mid costs you fill probability faster
+
+Both are properties of *market* order flow, not something the market maker chooses — which is why $k$ appears in the half-spread formula on the previous slide but has to be **estimated from data** rather than picked. Part 4 shows how.
 
 ## Simulating the Full Model
 
@@ -425,6 +440,98 @@ python main.py ../../../data/20260812_spy.txt --plot
 | $r, \delta$ (reservation price, half-spread) | Turns raw quoting into an inventory-aware policy | Previewed today; developed fully in CS 3 |
 
 The market maker's edge isn't just "the spread" — it's the spread plus rebates, minus fees and adverse selection, earned within the rules of a fragmented, priority-driven market. Today's tools let us reason about that institutional layer precisely; CS 3 is where you build the full inventory-aware policy on top of it.
+
+# Part 4: Some Hints on Case Study 3
+
+## Hint 1: Collecting Trade Deltas from the Tape
+
+CS 3 Section 1 asks you to calibrate $k$ and $A$ by relating *how far a trade's price sits from the prevailing mid* to *how often trades happen there*. Step one is just collecting those distances, $\delta = |\text{trade price} - \text{mid}|$, off the real tape:
+
+```{python}
+#| label: module08-cs3-deltas
+#| eval: true
+#| output-location: slide
+import sys
+sys.path.append("backtest")
+from fake_broker import _parse_line, QuoteUpdate, TradePrint
+
+MAX_MESSAGES = 300_000  # same cap backtest/main.py defaults to, keeps this demo fast
+
+bid = ask = None
+deltas = []
+first_time = last_time = None
+with open("../../data/20260812_spy.txt") as f:
+    for i, line in enumerate(f):
+        if i >= MAX_MESSAGES:
+            break
+        msg = _parse_line(line)
+        first_time = first_time or msg.time
+        last_time = msg.time
+        if isinstance(msg, QuoteUpdate):
+            bid, ask = msg.bid, msg.ask
+        elif isinstance(msg, TradePrint) and bid is not None:
+            deltas.append(abs(msg.price - (bid + ask) / 2))
+
+deltas = np.array(deltas)
+elapsed_seconds = (last_time - first_time).total_seconds()
+print(f"{len(deltas):,} trades over {elapsed_seconds:,.0f} seconds of tape")
+
+fig, ax = plt.subplots(figsize=(8, 4.5))
+ax.hist(deltas, bins=60, color="C0")
+ax.set_xlabel(r"$\delta$ = |trade price $-$ prevailing midpoint|")
+ax.set_ylabel("trade count")
+ax.set_title("How Far From the Mid Do Trades Actually Happen?")
+plt.tight_layout()
+plt.show()
+```
+
+- Reuses `_parse_line` from `backtest/fake_broker.py` instead of re-deriving tape parsing — the same parser the real backtest runs on.
+- A `QuoteUpdate` tells you the prevailing mid at that instant; the next `TradePrint` is one data point: "a trade happened at distance $\delta$ from the mid."
+- Most trades cluster right at the touch ($\delta$ near zero), thinning out fast as $\delta$ grows — exactly the shape $\lambda(\delta) = Ae^{-k\delta}$ is meant to capture.
+- `deltas` and `elapsed_seconds` are what Hint 2 buckets and fits.
+
+## Hint 2: Estimating $A$ and $k$, Conceptually
+
+The fill-intensity model says trades happen at distance $\delta$ from the mid at rate $\lambda(\delta) = Ae^{-k\delta}$. Taking logs turns this into something you can fit with a straight line:
+
+$$
+\log \lambda(\delta) = \log A - k\delta
+$$
+
+**The recipe:**
+
+1. **Bucket** the $\delta$'s from Hint 1 into bins.
+2. **Count** trades per bin, divide by the elapsed tape time to get an observed rate $\hat\lambda(\delta)$ per bin (trades per second at that distance).
+3. **Fit a line** to $\log \hat\lambda(\delta)$ vs. the bin's $\delta$ — the slope is $-k$, the intercept is $\log A$.
+
+```{python}
+#| label: module08-cs3-ak-fit
+#| eval: true
+#| output-location: slide
+bins = np.linspace(0, np.quantile(deltas, 0.95), 15)
+bin_mids = 0.5 * (bins[:-1] + bins[1:])
+counts, _ = np.histogram(deltas, bins=bins)
+rate = counts / elapsed_seconds
+
+keep = rate > 0  # log is undefined at zero -- drop empty bins
+k_hat, log_A_hat = np.polyfit(bin_mids[keep], np.log(rate[keep]), 1)
+k_hat = -k_hat
+A_hat = np.exp(log_A_hat)
+print(f"k_hat = {k_hat:.2f}, A_hat = {A_hat:.2f}")
+
+fig, ax = plt.subplots(figsize=(8, 4.5))
+ax.scatter(bin_mids, np.log(rate), color="C1", label="observed log-intensity")
+ax.plot(bin_mids, log_A_hat - k_hat * bin_mids, color="black", label=r"fitted $\log A - k\delta$")
+ax.set_xlabel(r"$\delta$")
+ax.set_ylabel(r"$\log \hat\lambda(\delta)$")
+ax.legend()
+plt.tight_layout()
+plt.show()
+```
+
+- This fits the *market's* aggregate trade intensity as a function of distance from the mid — you don't have a history of fills on your own resting orders, so the whole tape's trade arrivals are the standard stand-in for "how likely is an order resting at distance $\delta$ to get hit."
+- The real tape won't sit as neatly on the line as the simulator does — bucket counts get noisy once $\delta$ is large and trades there are rare. That's expected; say so in your prose cell rather than hiding it.
+- Once you have $\hat k, \hat A$ (and $\hat\sigma$ from realized volatility), plug them into `simulate_as` and compare against the real `main.py` backtest, per the case study prompt.
 
 ## What We Learned: Module 8 Summary
 
